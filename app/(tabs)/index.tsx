@@ -9,6 +9,8 @@ export default function HomeScreen() {
   if (status === "error") return <Text>{error}</Text>;
   if (!location) return null;
 
+  const { latitude, longitude } = location.coords;
+
   return (
     <View style={{ flex: 1 }}>
       <MapView
@@ -17,18 +19,15 @@ export default function HomeScreen() {
           height: "100%",
         }}
         initialRegion={{
-          latitude: location.coords.latitude,
-          longitude: location.coords.longitude,
+          latitude,
+          longitude,
           latitudeDelta: 0.01,
           longitudeDelta: 0.01,
         }}
       >
         <Marker
-          coordinate={{
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-          }}
-          title="You are here"
+          coordinate={{ latitude, longitude }}
+          title={`last updated ${location.timestamp}`}
         />
       </MapView>
     </View>

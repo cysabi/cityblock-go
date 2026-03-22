@@ -36,6 +36,7 @@
           "locationAlwaysAndWhenInUsePermission": "Allow citymap-go to use your location."
         }
       ],
+      "expo-task-manager",
       [
         "expo-splash-screen",
         {
