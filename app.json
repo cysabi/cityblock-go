@@ -11,10 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "UIBackgroundModes": [
-          "location",
-          "location"
-        ],
+        "UIBackgroundModes": ["location", "location"],
         "NSLocationWhenInUseUsageDescription": "Use background location",
         "NSLocationAlwaysAndWhenInUseUsageDescription": "Use location",
         "NSLocationUsageDescription": "location usage!"
@@ -61,7 +58,8 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "@maplibre/maplibre-react-native"
     ],
     "experiments": {
       "typedRoutes": true,
