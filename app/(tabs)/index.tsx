@@ -8,7 +8,9 @@ export default function HomeScreen() {
 
   const mapRef: any = useRef(null);
 
-  const [coords, setCoords] = useState<[number, number]>([-74.006, 40.7128]);
+  const [coords, setCoords] = useState<[number, number]>([
+    -73.985056, 40.691327,
+  ]);
 
   useEffect(() => {
     if (location) {
@@ -20,8 +22,12 @@ export default function HomeScreen() {
   if (status === "error") return <Text>{error}</Text>;
 
   return (
-    <MapView ref={mapRef} style={{ flex: 1 }}>
-      <Camera centerCoordinate={coords} zoomLevel={13} />
+    <MapView
+      ref={mapRef}
+      style={{ flex: 1 }}
+      mapStyle="https://api.maptiler.com/maps/streets-v2/style.json?key=ZkJOL4BGmS6lWcFXLlfG"
+    >
+      <Camera centerCoordinate={coords} zoomLevel={17} />
     </MapView>
   );
 }
