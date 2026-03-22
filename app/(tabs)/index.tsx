@@ -1,38 +1,36 @@
-import { Image } from "expo-image";
-import { View, StyleSheet } from "react-native";
-import MapView from "react-native-maps";
-import Location from "expo-location";
-import { useState } from "react";
+import { View, ActivityIndicator, Text } from "react-native";
+import MapView, { Marker } from "react-native-maps";
+import { useBackgroundLocation } from "@/hooks/use-location";
 
 export default function HomeScreen() {
-  const [location, setLocation] = useState<Location.LocationObject | null>(
-    null,
-  );
+  const { location, status, error } = useBackgroundLocation();
+
+  if (status === "starting") return <ActivityIndicator style={{ flex: 1 }} />;
+  if (status === "error") return <Text>{error}</Text>;
+  if (!location) return null;
 
   return (
-    <View style={styles.titleContainer}>
-      <MapView style={styles.map} />
+    <View style={{ flex: 1 }}>
+      <MapView
+        style={{
+          width: "100%",
+          height: "100%",
+        }}
+        initialRegion={{
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        }}
+      >
+        <Marker
+          coordinate={{
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+          }}
+          title="You are here"
+        />
+      </MapView>
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  map: {
-    width: "100%",
-    height: "100%",
-  },
-  titleContainer: {
-    flex: 1,
-  },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
-  },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
-    position: "absolute",
-  },
-});
