@@ -1,6 +1,7 @@
 import { useBackgroundLocation } from "@/hooks/use-location";
 import {
   Camera,
+  FillLayer,
   LineLayer,
   MapView,
   ShapeSource,
@@ -64,11 +65,18 @@ export default function HomeScreen() {
           <LineLayer
             id="routeLine"
             style={{
-              lineColor: "#4A90E2",
+              lineColor: "#DA3E15", // TODO: Change based on user team. #20B8EA is blue
               lineWidth: 4,
               lineOpacity: 0.8,
               lineCap: "round",
               lineJoin: "round",
+            }}
+          />
+          <FillLayer
+            id="routeShape"
+            style={{
+              fillColor: "#DA3E15",
+              fillOpacity: 0.5,
             }}
           />
         </ShapeSource>
