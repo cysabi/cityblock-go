@@ -5,126 +5,214 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 )
 
+// LineWidth is the physical width of a drawn line in meters.
+// Two lines "intersect" if their centerlines are within this distance,
+// meaning their 5m-wide buffers overlap.
+const LineWidth = 10.0
+
+// NearbyRadius is the search radius (meters) for reconnecting to an existing point.
+const NearbyRadius = 20.0
+
+const earthRadiusMeters = 6_371_000.0
+
 // ---------------------------------------------------------------------------
-// Constants
+// Conversion helpers
 // ---------------------------------------------------------------------------
 
-const (
-	LineWidthMeters    = 10.0
-	NearbyRadiusMeters = 20.0
-	EarthRadiusMeters  = 6_371_008.8
-	OSRMBaseURL        = "http://router.project-osrm.org/route/v1/foot"
-)
+func metersToAngle(m float64) s1.Angle {
+	return s1.Angle(m / earthRadiusMeters)
+}
+
+func metersToChordAngle(m float64) s1.ChordAngle {
+	return s1.ChordAngleFromAngle(metersToAngle(m))
+}
 
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
 
-type TimedPoint struct {
-	Point     s2.Point  `json:"-"`
-	Lat       float64   `json:"lat"`
-	Lng       float64   `json:"lng"`
-	Timestamp time.Time `json:"timestamp"`
+// TimestampedPoint pairs an S2 point with the moment it was recorded.
+type TimestampedPoint struct {
+	Point     s2.Point
+	Timestamp time.Time
 }
 
+// PlayerLine is a polyline the player is actively drawing, with per-vertex timestamps.
 type PlayerLine struct {
-	Points []TimedPoint `json:"points"`
+	Points   []TimestampedPoint
+	Polyline *s2.Polyline
 }
 
-type ClaimedArea struct {
-	Loop *s2.Loop `json:"-"`
-	// For JSON serialization we keep the raw lat/lngs.
-	Vertices []LatLng `json:"vertices"`
+// rebuildPolyline reconstructs the s2.Polyline from the timestamped points.
+func (pl *PlayerLine) rebuildPolyline() {
+	pts := make([]s2.Point, len(pl.Points))
+	for i, tp := range pl.Points {
+		pts[i] = tp.Point
+	}
+	poly := s2.Polyline(pts)
+	pl.Polyline = &poly
 }
 
-type LatLng struct {
+type Player struct {
+	ID      string
+	Team    string
+	City    string
+	Lines   []*PlayerLine
+	Claimed []*s2.Polygon
+}
+
+type GameState struct {
+	mu      sync.RWMutex
+	Colors  []string
+	Players map[string]*Player
+}
+
+func NewGameState(colors []string) *GameState {
+	return &GameState{
+		Colors:  colors,
+		Players: make(map[string]*Player),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// JSON response types (S2 types don't marshal to friendly JSON)
+// ---------------------------------------------------------------------------
+
+type LatLngJSON struct {
 	Lat float64 `json:"lat"`
 	Lng float64 `json:"lng"`
 }
 
-type Player struct {
-	ID      string        `json:"id"`
-	Team    string        `json:"team"`
-	City    string        `json:"city"`
-	Lines   []PlayerLine  `json:"lines"`
-	Claimed []ClaimedArea `json:"claimed"`
+type PolylineJSON struct {
+	Points []LatLngJSON `json:"points"`
 }
 
-type GameState struct {
-	Colors  []string  `json:"colors"`
-	Players []*Player `json:"players"`
-	mu      sync.RWMutex
+type PolygonJSON struct {
+	Loops [][]LatLngJSON `json:"loops"`
 }
 
-// ---------------------------------------------------------------------------
-// Global state
-// ---------------------------------------------------------------------------
-
-var state = &GameState{
-	Colors:  []string{"red", "blue", "green", "yellow"},
-	Players: []*Player{},
+type PlayerJSON struct {
+	ID      string         `json:"id"`
+	Team    string         `json:"team"`
+	City    string         `json:"city"`
+	Lines   []PolylineJSON `json:"lines"`
+	Claimed []PolygonJSON  `json:"claimed"`
 }
 
-// ---------------------------------------------------------------------------
-// Coordinate helpers
-// ---------------------------------------------------------------------------
-
-func llToPoint(lat, lng float64) s2.Point {
-	return s2.PointFromLatLng(s2.LatLngFromDegrees(lat, lng))
+type StateJSON struct {
+	Colors  []string     `json:"colors"`
+	Players []PlayerJSON `json:"players"`
 }
 
-func pointToLL(p s2.Point) (float64, float64) {
+func pointToLatLngJSON(p s2.Point) LatLngJSON {
 	ll := s2.LatLngFromPoint(p)
-	return ll.Lat.Degrees(), ll.Lng.Degrees()
+	return LatLngJSON{Lat: ll.Lat.Degrees(), Lng: ll.Lng.Degrees()}
 }
 
-// distanceMeters returns the great-circle distance between two s2.Points.
-func distanceMeters(a, b s2.Point) float64 {
-	angle := a.Distance(b) // radians on the unit sphere
-	return float64(angle) * EarthRadiusMeters
-}
+// SendState serialises the full game state to JSON and writes it out.
+func (gs *GameState) SendState(w http.ResponseWriter) {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
 
-// metersToAngle converts a metric distance to a unit-sphere angle (radians).
-func metersToAngle(m float64) float64 {
-	return m / EarthRadiusMeters
-}
-
-// polylineFromTimedPoints builds an s2.Polyline for spatial queries.
-func polylineFromTimedPoints(pts []TimedPoint) *s2.Polyline {
-	out := make(s2.Polyline, len(pts))
-	for i, p := range pts {
-		out[i] = p.Point
+	out := StateJSON{Colors: gs.Colors}
+	for _, p := range gs.Players {
+		pj := PlayerJSON{ID: p.ID, Team: p.Team, City: p.City}
+		for _, line := range p.Lines {
+			var pts []LatLngJSON
+			for _, tp := range line.Points {
+				pts = append(pts, pointToLatLngJSON(tp.Point))
+			}
+			pj.Lines = append(pj.Lines, PolylineJSON{Points: pts})
+		}
+		for _, poly := range p.Claimed {
+			var pjson PolygonJSON
+			for li := 0; li < poly.NumLoops(); li++ {
+				loop := poly.Loop(li)
+				var verts []LatLngJSON
+				for vi := 0; vi < loop.NumVertices(); vi++ {
+					verts = append(verts, pointToLatLngJSON(loop.Vertex(vi)))
+				}
+				pjson.Loops = append(pjson.Loops, verts)
+			}
+			pj.Claimed = append(pj.Claimed, pjson)
+		}
+		out.Players = append(out.Players, pj)
 	}
-	return &out
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 // ---------------------------------------------------------------------------
-// OSRM routing helper
+// Helper: point inside any claimed polygon?
 // ---------------------------------------------------------------------------
+
+func (gs *GameState) pointInAnyClaimed(pt s2.Point) bool {
+	for _, p := range gs.Players {
+		for _, poly := range p.Claimed {
+			if poly.ContainsPoint(pt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Helper: find the most-recent point within `radius` meters across a
+// player's lines. Returns the line index, vertex index, and true if found.
+// ---------------------------------------------------------------------------
+
+func findNearbyPoint(player *Player, pt s2.Point, radiusMeters float64) (lineIdx, vertIdx int, found bool) {
+	limit := metersToChordAngle(radiusMeters)
+	var bestTime time.Time
+
+	for li, line := range player.Lines {
+		for vi, tp := range line.Points {
+			dist := s2.ChordAngleBetweenPoints(pt, tp.Point)
+			if dist <= limit {
+				if !found || tp.Timestamp.After(bestTime) {
+					lineIdx, vertIdx, found = li, vi, true
+					bestTime = tp.Timestamp
+				}
+			}
+		}
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// Helper: fetch a walking route between two lat/lngs from OSRM.
+// Returns intermediate S2 points (excluding the start, including the end).
+// ---------------------------------------------------------------------------
+
+type osrmGeometry struct {
+	Type        string      `json:"type"`
+	Coordinates [][]float64 `json:"coordinates"` // [lng, lat]
+}
+
+type osrmRoute struct {
+	Geometry osrmGeometry `json:"geometry"`
+}
 
 type osrmResponse struct {
-	Routes []struct {
-		Geometry struct {
-			Coordinates [][]float64 `json:"coordinates"`
-		} `json:"geometry"`
-	} `json:"routes"`
+	Code   string      `json:"code"`
+	Routes []osrmRoute `json:"routes"`
 }
 
-// GetOSRMRoute calls the public OSRM demo server to get a walkable route
-// between two lat/lng pairs. Returns the intermediate points (excluding the
-// endpoints themselves so they can be stitched without duplication).
-func GetOSRMRoute(fromLat, fromLng, toLat, toLng float64) ([]TimedPoint, error) {
+func fetchRoute(from, to s2.LatLng) ([]s2.Point, error) {
 	url := fmt.Sprintf(
-		"%s/%f,%f;%f,%f?overview=full&geometries=geojson",
-		OSRMBaseURL, fromLng, fromLat, toLng, toLat,
+		"https://router.project-osrm.org/route/v1/foot/%f,%f;%f,%f?overview=full&geometries=geojson",
+		from.Lng.Degrees(), from.Lat.Degrees(),
+		to.Lng.Degrees(), to.Lat.Degrees(),
 	)
 
 	resp, err := http.Get(url)
@@ -142,471 +230,474 @@ func GetOSRMRoute(fromLat, fromLng, toLat, toLng float64) ([]TimedPoint, error) 
 	if err := json.Unmarshal(body, &osrm); err != nil {
 		return nil, fmt.Errorf("osrm decode: %w", err)
 	}
-	if len(osrm.Routes) == 0 {
-		return nil, fmt.Errorf("osrm returned no routes")
+	if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
+		return nil, fmt.Errorf("osrm returned code %s", osrm.Code)
 	}
 
 	coords := osrm.Routes[0].Geometry.Coordinates
-	now := time.Now()
-	// Skip the first and last coordinate (they duplicate the from/to points).
-	var pts []TimedPoint
-	for i := 1; i < len(coords)-1; i++ {
-		lng, lat := coords[i][0], coords[i][1]
-		pts = append(pts, TimedPoint{
-			Point:     llToPoint(lat, lng),
-			Lat:       lat,
-			Lng:       lng,
-			Timestamp: now,
-		})
+	// Skip the first coordinate (it's the `from` point we already have).
+	pts := make([]s2.Point, 0, len(coords)-1)
+	for i := 1; i < len(coords); i++ {
+		ll := s2.LatLngFromDegrees(coords[i][1], coords[i][0])
+		pts = append(pts, s2.PointFromLatLng(ll))
 	}
 	return pts, nil
 }
 
-// ---------------------------------------------------------------------------
-// Helper: find nearest recent point within radius
-// ---------------------------------------------------------------------------
-
-// NearestRecentPoint scans every point across all of a player's polylines and
-// returns the line index + point index of the most recent point that falls
-// within `radiusMeters` of `target`. Returns (-1, -1) if nothing is close.
-func NearestRecentPoint(player *Player, target s2.Point, radiusMeters float64) (lineIdx, ptIdx int) {
-	lineIdx, ptIdx = -1, -1
-	var best time.Time
-
-	for li, line := range player.Lines {
-		for pi, tp := range line.Points {
-			if distanceMeters(target, tp.Point) <= radiusMeters {
-				if tp.Timestamp.After(best) {
-					best = tp.Timestamp
-					lineIdx = li
-					ptIdx = pi
-				}
-			}
-		}
+// joinViaRoute extends a PlayerLine to a destination by fetching an OSRM
+// walking route and appending the intermediate points.
+func joinViaRoute(line *PlayerLine, dest s2.Point, ts time.Time) error {
+	if len(line.Points) == 0 {
+		return fmt.Errorf("line has no points")
 	}
-	return lineIdx, ptIdx
-}
 
-// ---------------------------------------------------------------------------
-// Helper: join polyline to point via OSRM route
-// ---------------------------------------------------------------------------
+	fromLL := s2.LatLngFromPoint(line.Points[len(line.Points)-1].Point)
+	toLL := s2.LatLngFromPoint(dest)
 
-// JoinPolylineToPoint appends a routed path from the last point of
-// player.Lines[lineIdx] to `dest`, mutating the line in place.
-func JoinPolylineToPoint(player *Player, lineIdx int, dest TimedPoint) error {
-	line := &player.Lines[lineIdx]
-	last := line.Points[len(line.Points)-1]
-
-	route, err := GetOSRMRoute(last.Lat, last.Lng, dest.Lat, dest.Lng)
+	routePts, err := fetchRoute(fromLL, toLL)
 	if err != nil {
 		return err
 	}
 
-	line.Points = append(line.Points, route...)
-	line.Points = append(line.Points, dest)
+	for _, rp := range routePts {
+		line.Points = append(line.Points, TimestampedPoint{Point: rp, Timestamp: ts})
+	}
+	line.rebuildPolyline()
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Helper: polyline ↔ polyline intersection (width-aware)
+// Helper: buffered intersection test between two polylines.
+// Returns true plus the edge indices on each polyline if they come within
+// `bufferMeters` of each other.
 // ---------------------------------------------------------------------------
 
-// segmentMinDist returns the minimum distance in meters between two edges
-// (a0→a1) and (b0→b1). It samples the closest-point-on-edge approach.
-func segmentMinDist(a0, a1, b0, b1 s2.Point) float64 {
-	edge1 := s2.Edge{V0: a0, V1: a1}
-	edge2 := s2.Edge{V0: b0, V1: b1}
+func polylinesIntersectBuffered(a, b *s2.Polyline, bufferMeters float64) (
+	hit bool, aEdgeIdx int, bEdgeIdx int, closestA, closestB s2.Point,
+) {
+	limit := metersToChordAngle(bufferMeters)
+	bestDist := s1.InfChordAngle()
 
-	// Use the s2 EdgePairMinDistance which returns a ChordAngle.
-	ca := s2.EdgePairMinDistance(edge1.V0, edge1.V1, edge2.V0, edge2.V1, s2.InfChordAngle())
-	return ca.Angle().Radians() * EarthRadiusMeters
+	// Build a ShapeIndex on `a` so we can use EdgeQuery.
+	idx := s2.NewShapeIndex()
+	idx.Add(a)
+	idx.Build()
+
+	opts := s2.NewClosestEdgeQueryOptions().DistanceLimit(limit).MaxResults(1)
+
+	for bi := 0; bi < b.NumEdges(); bi++ {
+		bEdge := b.Edge(bi)
+		target := s2.NewMinDistanceToEdgeTarget(bEdge)
+
+		query := s2.NewClosestEdgeQuery(idx, opts)
+		results := query.FindEdges(target)
+		if len(results) == 0 {
+			continue
+		}
+		r := results[0]
+		if r.Distance() < bestDist {
+			bestDist = r.Distance()
+			aEdgeIdx = int(r.EdgeID())
+			bEdgeIdx = bi
+			aEdge := a.Edge(aEdgeIdx)
+			closestA, closestB = s2.EdgePairClosestPoints(
+				aEdge.V0, aEdge.V1, bEdge.V0, bEdge.V1,
+			)
+			hit = true
+		}
+	}
+	return
 }
 
-// PolylinesIntersect returns true if any edge of A is within LineWidthMeters
-// of any edge of B (i.e. the "buffered" lines overlap).
-// When true it also returns the indices (on A and B) of the first pair of
-// edges that triggered the intersection.
-func PolylinesIntersect(a, b []TimedPoint) (bool, int, int) {
-	for i := 0; i < len(a)-1; i++ {
-		for j := 0; j < len(b)-1; j++ {
-			d := segmentMinDist(a[i].Point, a[i+1].Point, b[j].Point, b[j+1].Point)
-			if d <= LineWidthMeters {
-				return true, i, j
+// ---------------------------------------------------------------------------
+// Helper: detect self-intersection after extending a polyline.
+// `oldEdgeCount` is how many edges existed before the extension.
+// We check every new edge against every non-adjacent old edge.
+// ---------------------------------------------------------------------------
+
+func findSelfIntersection(pl *s2.Polyline, oldEdgeCount int) (
+	found bool, crossPt s2.Point, oldEdgeIdx int, newEdgeIdx int,
+) {
+	limit := metersToChordAngle(LineWidth)
+	bestDist := s1.InfChordAngle()
+
+	for ni := oldEdgeCount; ni < pl.NumEdges(); ni++ {
+		ne := pl.Edge(ni)
+		// Stop before the edge adjacent to the join point to avoid
+		// false positives from shared vertices.
+		maxOld := oldEdgeCount - 1
+		if ni == oldEdgeCount {
+			maxOld = oldEdgeCount - 2 // skip the shared-vertex neighbour
+		}
+		for oi := 0; oi < maxOld && oi < oldEdgeCount; oi++ {
+			oe := pl.Edge(oi)
+			ca, cb := s2.EdgePairClosestPoints(oe.V0, oe.V1, ne.V0, ne.V1)
+			dist := s2.ChordAngleBetweenPoints(ca, cb)
+			if dist <= limit && dist < bestDist {
+				bestDist = dist
+				crossPt = s2.Interpolate(0.5, ca, cb)
+				oldEdgeIdx = oi
+				newEdgeIdx = ni
+				found = true
 			}
 		}
 	}
-	return false, -1, -1
+	return
 }
 
 // ---------------------------------------------------------------------------
-// Helper: point inside any claimed polygon
+// Helper: extract a polygon from the loop portion of a self-intersecting
+// polyline. The loop spans from oldEdgeIdx+1 through newEdgeIdx, closed
+// by the crossPt.
 // ---------------------------------------------------------------------------
 
-func PointInAnyClaimed(players []*Player, pt s2.Point) bool {
-	for _, p := range players {
-		for _, c := range p.Claimed {
-			if c.Loop.ContainsPoint(pt) {
-				return true
-			}
-		}
+func createPolygonFromSelfIntersection(pl *s2.Polyline, crossPt s2.Point, oldEdgeIdx, newEdgeIdx int) *s2.Polygon {
+	pts := *pl
+	// Loop vertices: crossPt, V_{oldEdgeIdx+1}, ..., V_{newEdgeIdx}, crossPt
+	var loopPts []s2.Point
+	loopPts = append(loopPts, crossPt)
+	for i := oldEdgeIdx + 1; i <= newEdgeIdx; i++ {
+		loopPts = append(loopPts, pts[i])
 	}
-	return false
-}
-
-// ---------------------------------------------------------------------------
-// Helper: create polygon (shape) from a self-intersecting line
-// ---------------------------------------------------------------------------
-
-// CreateShapeFromLoop extracts the loop portion of a polyline between indices
-// `from` and `to` (inclusive) and builds a ClaimedArea polygon.
-func CreateShapeFromLoop(pts []TimedPoint, from, to int) ClaimedArea {
-	loopPts := make([]s2.Point, 0, to-from+1)
-	verts := make([]LatLng, 0, to-from+1)
-
-	for i := from; i <= to; i++ {
-		loopPts = append(loopPts, pts[i].Point)
-		verts = append(verts, LatLng{Lat: pts[i].Lat, Lng: pts[i].Lng})
-	}
-
+	// Close back to crossPt (the Loop constructor handles the implicit closing edge).
 	loop := s2.LoopFromPoints(loopPts)
-	// Normalize so the loop encloses the smaller area.
-	loop.Normalize()
-
-	return ClaimedArea{
-		Loop:     loop,
-		Vertices: verts,
-	}
+	loop.Normalize() // ensure CCW orientation
+	return s2.PolygonFromLoops([]*s2.Loop{loop})
 }
 
 // ---------------------------------------------------------------------------
-// Helper: subtract already-claimed areas from a new shape
+// Helper: subtract already-claimed polygons from a newly created polygon.
+// Uses RegionCoverer + CellUnion difference as an approximation, since the
+// S2 Go library doesn't expose direct polygon boolean operations.
 // ---------------------------------------------------------------------------
 
-// SubtractClaimed removes overlap between `area` and every existing claimed
-// polygon owned by the player. Full boolean polygon subtraction on the sphere
-// is non-trivial; here we approximate by dropping any vertex of `area` that
-// falls inside an existing claim, then rebuilding the loop.
+func subtractClaimed(newPoly *s2.Polygon, claimed []*s2.Polygon) *s2.Polygon {
+	rc := s2.NewRegionCoverer()
+	// Defaults are reasonable; tune MaxLevel / MaxCells if precision matters.
+
+	remaining := rc.Covering(newPoly)
+
+	for _, cp := range claimed {
+		claimedCU := rc.Covering(cp)
+		remaining = s2.CellUnionFromDifference(remaining, claimedCU)
+	}
+
+	if len(remaining) == 0 {
+		return nil
+	}
+
+	// Convert the surviving CellUnion back to a Polygon (one loop per cell).
+	loops := make([]*s2.Loop, len(remaining))
+	for i, cid := range remaining {
+		loops[i] = s2.LoopFromCell(s2.CellFromCellID(cid))
+	}
+	return s2.PolygonFromLoops(loops)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: after a polygon is carved out of a polyline, return the leftover
+// "extruding" tails as new PlayerLines.
 //
-// For a production system, replace this with a proper polygon-clipping
-// library (e.g. S2 BooleanOperation in C++ ported to Go, or a planar
-// clipper after projecting to a local tangent plane).
-func SubtractClaimed(area ClaimedArea, player *Player) ClaimedArea {
-	var kept []s2.Point
-	var keptLL []LatLng
+//   Original: V0 ... V_{oldEdge} [loop] V_{newEdge+1} ... V_end
+//   Tail 1 (before loop): V0 ... V_{oldEdge}, crossPt
+//   Tail 2 (after loop):  crossPt, V_{newEdge+1} ... V_end
+// ---------------------------------------------------------------------------
 
-	for i, v := range area.Vertices {
-		inside := false
-		for _, c := range player.Claimed {
-			if c.Loop.ContainsPoint(area.Loop.Vertex(i)) {
-				inside = true
-				break
-			}
+func splitLineAfterPolygon(line *PlayerLine, crossPt s2.Point, oldEdgeIdx, newEdgeIdx int, ts time.Time) []*PlayerLine {
+	var tails []*PlayerLine
+
+	// Tail before the loop (at least 2 vertices to be a valid polyline).
+	if oldEdgeIdx+1 >= 1 {
+		var pts []TimestampedPoint
+		for i := 0; i <= oldEdgeIdx; i++ {
+			pts = append(pts, line.Points[i])
 		}
-		if !inside {
-			kept = append(kept, area.Loop.Vertex(i))
-			keptLL = append(keptLL, v)
+		pts = append(pts, TimestampedPoint{Point: crossPt, Timestamp: ts})
+		tail := &PlayerLine{Points: pts}
+		tail.rebuildPolyline()
+		if len(*tail.Polyline) >= 2 {
+			tails = append(tails, tail)
 		}
 	}
 
-	if len(kept) < 3 {
-		// Degenerate after subtraction — return empty.
-		return ClaimedArea{Loop: s2.EmptyLoop(), Vertices: nil}
+	// Tail after the loop.
+	if newEdgeIdx+1 < len(line.Points) {
+		pts := []TimestampedPoint{{Point: crossPt, Timestamp: ts}}
+		for i := newEdgeIdx + 1; i < len(line.Points); i++ {
+			pts = append(pts, line.Points[i])
+		}
+		tail := &PlayerLine{Points: pts}
+		tail.rebuildPolyline()
+		if len(*tail.Polyline) >= 2 {
+			tails = append(tails, tail)
+		}
 	}
 
-	loop := s2.LoopFromPoints(kept)
-	loop.Normalize()
-	return ClaimedArea{Loop: loop, Vertices: keptLL}
+	return tails
 }
 
 // ---------------------------------------------------------------------------
-// Helper: replace lines with shape, keep extruding remainder
+// Helper: check if a polygon (buffered by LineWidth) intersects any of an
+// opponent's polylines. Returns the indices of intersecting lines.
 // ---------------------------------------------------------------------------
 
-// ReplaceLineWithShape removes the loop segment [from..to] from the line and
-// adds the resulting polygon to claimed. If there are leftover points before
-// `from` or after `to`, they become new independent polylines.
-func ReplaceLineWithShape(player *Player, lineIdx, from, to int) {
-	line := player.Lines[lineIdx]
+func findIntersectingOpponentLines(poly *s2.Polygon, opponent *Player) []int {
+	// Build ShapeIndex for the polygon.
+	polyIdx := s2.NewShapeIndex()
+	polyIdx.Add(poly)
+	polyIdx.Build()
 
-	// Build & subtract the shape.
-	shape := CreateShapeFromLoop(line.Points, from, to)
-	shape = SubtractClaimed(shape, player)
-	if shape.Loop != nil && !shape.Loop.IsEmpty() {
-		player.Claimed = append(player.Claimed, shape)
+	limit := metersToChordAngle(LineWidth)
+	var hits []int
+
+	for li, line := range opponent.Lines {
+		if line.Polyline == nil || len(*line.Polyline) < 2 {
+			continue
+		}
+		lineIdx := s2.NewShapeIndex()
+		lineIdx.Add(line.Polyline)
+		lineIdx.Build()
+
+		target := s2.NewMinDistanceToShapeIndexTarget(lineIdx)
+		query := s2.NewClosestEdgeQuery(polyIdx, s2.NewClosestEdgeQueryOptions().MaxResults(1))
+		if query.IsDistanceLess(target, limit) {
+			hits = append(hits, li)
+		}
 	}
-
-	// Build residual polylines from the parts of the line outside the loop.
-	var newLines []PlayerLine
-
-	// Keep points before the loop start (the "tail" leading in).
-	if from > 0 {
-		newLines = append(newLines, PlayerLine{Points: line.Points[:from+1]})
-	}
-	// Keep points after the loop end (the "extruding" part).
-	if to < len(line.Points)-1 {
-		newLines = append(newLines, PlayerLine{Points: line.Points[to:]})
-	}
-
-	// Remove original line and splice in the residuals.
-	player.Lines = append(player.Lines[:lineIdx], player.Lines[lineIdx+1:]...)
-	player.Lines = append(player.Lines, newLines...)
+	return hits
 }
 
 // ---------------------------------------------------------------------------
-// Helper: destroy an opponent line and any connected lines
+// Helper: destroy a line and any lines "connected" to it (sharing an
+// endpoint within LineWidth). Works iteratively to cascade.
 // ---------------------------------------------------------------------------
 
-// DestroyLineAndConnected removes `lines[targetIdx]` and any other lines
-// whose endpoints are within LineWidthMeters of the removed line's endpoints
-// (recursively).
-func DestroyLineAndConnected(lines []PlayerLine, targetIdx int) []PlayerLine {
-	destroyed := map[int]bool{targetIdx: true}
-	queue := []int{targetIdx}
-
-	endpointsOf := func(l PlayerLine) (s2.Point, s2.Point) {
-		return l.Points[0].Point, l.Points[len(l.Points)-1].Point
-	}
+func destroyConnectedLines(player *Player, seedIndices []int) {
+	destroyed := make(map[int]bool)
+	queue := append([]int{}, seedIndices...)
 
 	for len(queue) > 0 {
-		ci := queue[0]
+		idx := queue[0]
 		queue = queue[1:]
-		startC, endC := endpointsOf(lines[ci])
+		if destroyed[idx] || idx >= len(player.Lines) {
+			continue
+		}
+		destroyed[idx] = true
 
-		for i, other := range lines {
-			if destroyed[i] {
+		line := player.Lines[idx]
+		if len(line.Points) == 0 {
+			continue
+		}
+
+		endpoints := []s2.Point{
+			line.Points[0].Point,
+			line.Points[len(line.Points)-1].Point,
+		}
+		limit := metersToChordAngle(LineWidth)
+
+		// Find other lines sharing an endpoint.
+		for oi, other := range player.Lines {
+			if destroyed[oi] || len(other.Points) == 0 {
 				continue
 			}
-			startO, endO := endpointsOf(other)
-			if distanceMeters(startC, startO) <= LineWidthMeters ||
-				distanceMeters(startC, endO) <= LineWidthMeters ||
-				distanceMeters(endC, startO) <= LineWidthMeters ||
-				distanceMeters(endC, endO) <= LineWidthMeters {
-				destroyed[i] = true
-				queue = append(queue, i)
+			otherEndpoints := []s2.Point{
+				other.Points[0].Point,
+				other.Points[len(other.Points)-1].Point,
+			}
+			for _, ep := range endpoints {
+				for _, oep := range otherEndpoints {
+					if s2.ChordAngleBetweenPoints(ep, oep) <= limit {
+						queue = append(queue, oi)
+					}
+				}
 			}
 		}
 	}
 
-	var kept []PlayerLine
-	for i, l := range lines {
+	// Remove destroyed lines in reverse order to preserve indices.
+	var kept []*PlayerLine
+	for i, line := range player.Lines {
 		if !destroyed[i] {
-			kept = append(kept, l)
+			kept = append(kept, line)
 		}
 	}
-	return kept
+	player.Lines = kept
 }
 
 // ---------------------------------------------------------------------------
-// Core game logic
+// Core game logic: ReceivePing
 // ---------------------------------------------------------------------------
 
-func findPlayer(id string) *Player {
-	for _, p := range state.Players {
-		if p.ID == id {
-			return p
-		}
-	}
-	return nil
-}
+func (gs *GameState) ReceivePing(playerID string, lat, lng float64, ts time.Time) error {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
 
-func opponents(team string) []*Player {
-	var out []*Player
-	for _, p := range state.Players {
-		if p.Team != team {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// ReceiveLat is the core logic executed when a player pings a new position.
-func ReceiveLat(playerID string, lat, lng float64, ts time.Time) error {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	player := findPlayer(playerID)
-	if player == nil {
+	player, ok := gs.Players[playerID]
+	if !ok {
 		return fmt.Errorf("unknown player %s", playerID)
 	}
 
-	incomingPt := llToPoint(lat, lng)
+	pt := s2.PointFromLatLng(s2.LatLngFromDegrees(lat, lng))
 
-	// 1. If position is already inside a claimed shape, ignore.
-	if PointInAnyClaimed(state.Players, incomingPt) {
+	// ---- 1. If position is already inside a claimed shape, ignore. --------
+	if gs.pointInAnyClaimed(pt) {
 		return nil
 	}
 
-	tp := TimedPoint{
-		Point:     incomingPt,
-		Lat:       lat,
-		Lng:       lng,
-		Timestamp: ts,
-	}
+	// ---- 2. Find the most-recent nearby point within 20 m. ----------------
+	lineIdx, vertIdx, found := findNearbyPoint(player, pt, NearbyRadius)
 
-	// 2. Find nearest recent point within 20 m.
-	lineIdx, ptIdx := NearestRecentPoint(player, incomingPt, NearbyRadiusMeters)
-
-	if lineIdx == -1 {
-		// ------------------------------------------------------------------
-		// No nearby point → start a brand-new polyline with a single vertex.
-		// ------------------------------------------------------------------
-		player.Lines = append(player.Lines, PlayerLine{Points: []TimedPoint{tp}})
+	if !found {
+		// ---- 3a. No nearby point → start a brand-new polyline. -------------
+		newLine := &PlayerLine{
+			Points: []TimestampedPoint{{Point: pt, Timestamp: ts}},
+		}
+		poly := s2.Polyline([]s2.Point{pt})
+		newLine.Polyline = &poly
+		player.Lines = append(player.Lines, newLine)
 		return nil
 	}
 
-	// ------------------------------------------------------------------
-	// Nearby point found → join to end of that line via OSRM route.
-	// ------------------------------------------------------------------
-	_ = ptIdx // We always append to the line's tail.
-	if err := JoinPolylineToPoint(player, lineIdx, tp); err != nil {
-		// If OSRM fails, fall back to a straight-line append.
-		player.Lines[lineIdx].Points = append(player.Lines[lineIdx].Points, tp)
+	// ---- 3b. Nearby point found → join to it via OSRM route. --------------
+	line := player.Lines[lineIdx]
+	_ = vertIdx // The nearby point identifies the line; we extend from its tip.
+
+	oldEdgeCount := 0
+	if line.Polyline != nil {
+		oldEdgeCount = line.Polyline.NumEdges()
 	}
 
-	// 3. Check self-intersection (same player's lines).
-	for i := 0; i < len(player.Lines); i++ {
-		for j := i; j < len(player.Lines); j++ {
-			var hit bool
-			var ai, _ int
-			if i == j {
-				// Self-intersection within the same polyline.
-				pts := player.Lines[i].Points
-				if len(pts) < 4 {
-					continue
-				}
-				// Compare non-adjacent edges.
-				hit, ai, _ = selfIntersects(pts)
-			} else {
-				hit, ai, _ = PolylinesIntersect(
-					player.Lines[i].Points,
-					player.Lines[j].Points,
-				)
-			}
+	if err := joinViaRoute(line, pt, ts); err != nil {
+		// Fallback: just append the point directly (straight-line join).
+		line.Points = append(line.Points, TimestampedPoint{Point: pt, Timestamp: ts})
+		line.rebuildPolyline()
+	}
 
-			if hit {
-				// Create shape, subtract claimed, replace line.
-				if i == j {
-					ReplaceLineWithShape(player, i, ai, len(player.Lines[i].Points)-1)
-				} else {
-					// Merge the two lines conceptually; use line i's range.
-					ReplaceLineWithShape(player, i, ai, len(player.Lines[i].Points)-1)
-				}
+	// ---- 4. Check for self-intersection (creates a polygon). ---------------
+	if line.Polyline == nil || oldEdgeCount < 1 {
+		return nil
+	}
 
-				// 4. Check if new shape intersects opponent lines.
-				for _, opp := range opponents(player.Team) {
-					toDestroy := []int{}
-					for oi, ol := range opp.Lines {
-						for _, claimed := range player.Claimed {
-							for k := 0; k < len(ol.Points)-1; k++ {
-								edge := s2.Edge{V0: ol.Points[k].Point, V1: ol.Points[k+1].Point}
-								_ = edge
-								if claimed.Loop.ContainsPoint(ol.Points[k].Point) {
-									toDestroy = append(toDestroy, oi)
-									break
-								}
-							}
-						}
-					}
-					// Destroy from highest index down to avoid shifting.
-					for d := len(toDestroy) - 1; d >= 0; d-- {
-						opp.Lines = DestroyLineAndConnected(opp.Lines, toDestroy[d])
-					}
-				}
+	selfHit, crossPt, oldEI, newEI := findSelfIntersection(line.Polyline, oldEdgeCount)
+	if !selfHit {
+		return nil
+	}
 
-				// After mutation the indices are stale; break out.
-				return nil
-			}
+	// ---- 5. Create polygon from the loop portion. --------------------------
+	rawPoly := createPolygonFromSelfIntersection(line.Polyline, crossPt, oldEI, newEI)
+	if rawPoly == nil {
+		return nil
+	}
+
+	// Subtract already-claimed areas.
+	allClaimed := collectAllClaimed(gs)
+	finalPoly := subtractClaimed(rawPoly, allClaimed)
+	if finalPoly == nil {
+		return nil
+	}
+
+	// ---- 6. Replace the line with its leftover tails. ----------------------
+	tails := splitLineAfterPolygon(line, crossPt, oldEI, newEI, ts)
+
+	// Swap the original line out for the tails.
+	var newLines []*PlayerLine
+	for i, l := range player.Lines {
+		if i == lineIdx {
+			newLines = append(newLines, tails...)
+		} else {
+			newLines = append(newLines, l)
+		}
+	}
+	player.Lines = newLines
+
+	// Record the claimed polygon.
+	player.Claimed = append(player.Claimed, finalPoly)
+
+	// ---- 7. Check if new shape intersects opponent lines. ------------------
+	for _, opp := range gs.Players {
+		if opp.ID == playerID {
+			continue
+		}
+		if opp.Team == player.Team {
+			continue // teammates are safe
+		}
+		hits := findIntersectingOpponentLines(finalPoly, opp)
+		if len(hits) > 0 {
+			destroyConnectedLines(opp, hits)
 		}
 	}
 
 	return nil
 }
 
-// selfIntersects checks whether a single polyline crosses itself. It compares
-// every edge against every non-adjacent edge.
-func selfIntersects(pts []TimedPoint) (bool, int, int) {
-	for i := 0; i < len(pts)-1; i++ {
-		// Start j at i+2 to skip the immediately adjacent edge.
-		for j := i + 2; j < len(pts)-1; j++ {
-			d := segmentMinDist(pts[i].Point, pts[i+1].Point, pts[j].Point, pts[j+1].Point)
-			if d <= LineWidthMeters {
-				return true, i, j
-			}
-		}
+// collectAllClaimed gathers every claimed polygon from every player.
+func collectAllClaimed(gs *GameState) []*s2.Polygon {
+	var all []*s2.Polygon
+	for _, p := range gs.Players {
+		all = append(all, p.Claimed...)
 	}
-	return false, -1, -1
+	return all
 }
 
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-// SendState serializes the full game state as JSON.
-func SendState(w http.ResponseWriter, r *http.Request) {
-	state.mu.RLock()
-	defer state.mu.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(state)
-}
-
-// PingEndpoint receives a player's lat/lng and updates the game state.
-//
-//	GET /ping?id=<playerID>&lat=<lat>&lng=<lng>&ts=<unix_ms>
-func PingEndpoint(w http.ResponseWriter, r *http.Request) {
+func (gs *GameState) PingEndpoint(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	playerID := q.Get("id")
+	playerID := q.Get("player_id")
 	if playerID == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
+		http.Error(w, "missing player_id", http.StatusBadRequest)
 		return
 	}
 
+	latStr := q.Get("lat")
+	lngStr := q.Get("lng")
 	var lat, lng float64
-	if _, err := fmt.Sscanf(q.Get("lat"), "%f", &lat); err != nil {
-		http.Error(w, "bad lat", http.StatusBadRequest)
+	if _, err := fmt.Sscanf(latStr, "%f", &lat); err != nil {
+		http.Error(w, "invalid lat", http.StatusBadRequest)
 		return
 	}
-	if _, err := fmt.Sscanf(q.Get("lng"), "%f", &lng); err != nil {
-		http.Error(w, "bad lng", http.StatusBadRequest)
+	if _, err := fmt.Sscanf(lngStr, "%f", &lng); err != nil {
+		http.Error(w, "invalid lng", http.StatusBadRequest)
 		return
 	}
 
-	if err := ReceiveLat(playerID, lat, lng, time.Now()); err != nil {
+	// Use the Date header if present, otherwise fall back to server time.
+	ts := time.Now()
+	if dateStr := r.Header.Get("Date"); dateStr != "" {
+		if parsed, err := time.Parse(time.RFC1123, dateStr); err == nil {
+			ts = parsed
+		}
+	}
+
+	if err := gs.ReceivePing(playerID, lat, lng, ts); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Return updated state to the pinging client.
-	SendState(w, r)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"ok":true}`))
+}
+
+func (gs *GameState) StateEndpoint(w http.ResponseWriter, r *http.Request) {
+	gs.SendState(w)
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrap: seed a couple of test players (remove in production)
-// ---------------------------------------------------------------------------
-
-func seedTestPlayers() {
-	state.Players = append(state.Players,
-		&Player{ID: "p1", Team: "red", City: "New York"},
-		&Player{ID: "p2", Team: "blue", City: "New York"},
-	)
-}
-
-// ---------------------------------------------------------------------------
-// Unused import guard (math is used via EarthRadiusMeters constant usage)
-// ---------------------------------------------------------------------------
-var _ = math.Pi
-
-// ---------------------------------------------------------------------------
-// Main
+// Bootstrap
 // ---------------------------------------------------------------------------
 
 func main() {
-	seedTestPlayers()
+	gs := NewGameState([]string{"red", "blue"})
 
-	http.HandleFunc("/ping", PingEndpoint)
-	http.HandleFunc("/state", SendState)
+	// Seed some players for testing.
+	gs.Players["alice"] = &Player{ID: "alice", Team: "red", City: "New York"}
+	gs.Players["bob"] = &Player{ID: "bob", Team: "blue", City: "New York"}
 
-	addr := ":8080"
-	log.Printf("game server listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	http.HandleFunc("/ping", gs.PingEndpoint)
+	http.HandleFunc("/state", gs.StateEndpoint)
+
+	log.Println("listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
