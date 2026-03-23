@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/engelsjk/polygol"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 )
@@ -312,64 +313,9 @@ func joinViaRoute(line *PlayerLine, dest s2.Point, ts time.Time) error {
 		return fmt.Errorf("line has no points")
 	}
 
-	// fromLL := s2.LatLngFromPoint(line.Points[len(line.Points)-1].Point)
-	// toLL := s2.LatLngFromPoint(dest)
-
 	line.Points = append(line.Points, TimestampedPoint{Point: dest, Timestamp: ts})
-
-	// routePts, err := fetchRoute(fromLL, toLL)
-	// if err != nil {
-	// 	return err
-	// }
-
-	// for _, rp := range routePts {
-	// 	line.Points = append(line.Points, TimestampedPoint{Point: rp, Timestamp: ts})
-	// }
 	line.rebuildPolyline()
 	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Helper: buffered intersection test between two polylines.
-// Returns true plus the edge indices on each polyline if they come within
-// `bufferMeters` of each other.
-// ---------------------------------------------------------------------------
-
-func polylinesIntersectBuffered(a, b *s2.Polyline, bufferMeters float64) (
-	hit bool, aEdgeIdx int, bEdgeIdx int, closestA, closestB s2.Point,
-) {
-	limit := metersToChordAngle(bufferMeters)
-	bestDist := s1.InfChordAngle()
-
-	// Build a ShapeIndex on `a` so we can use EdgeQuery.
-	idx := s2.NewShapeIndex()
-	idx.Add(a)
-	idx.Build()
-
-	opts := s2.NewClosestEdgeQueryOptions().DistanceLimit(limit).MaxResults(1)
-
-	for bi := 0; bi < b.NumEdges(); bi++ {
-		bEdge := b.Edge(bi)
-		target := s2.NewMinDistanceToEdgeTarget(bEdge)
-
-		query := s2.NewClosestEdgeQuery(idx, opts)
-		results := query.FindEdges(target)
-		if len(results) == 0 {
-			continue
-		}
-		r := results[0]
-		if r.Distance() < bestDist {
-			bestDist = r.Distance()
-			aEdgeIdx = int(r.EdgeID())
-			bEdgeIdx = bi
-			aEdge := a.Edge(aEdgeIdx)
-			closestA, closestB = s2.EdgePairClosestPoints(
-				aEdge.V0, aEdge.V1, bEdge.V0, bEdge.V1,
-			)
-			hit = true
-		}
-	}
-	return
 }
 
 // ---------------------------------------------------------------------------
@@ -428,32 +374,78 @@ func createPolygonFromSelfIntersection(pl *s2.Polyline, crossPt s2.Point, oldEdg
 }
 
 // ---------------------------------------------------------------------------
-// Helper: subtract already-claimed polygons from a newly created polygon.
-// Uses RegionCoverer + CellUnion difference as an approximation, since the
-// S2 Go library doesn't expose direct polygon boolean operations.
+// polygol conversion helpers
+// ---------------------------------------------------------------------------
+
+// s2PolyToGeom converts an S2 Polygon into a polygol Geom (MultiPolygon coords).
+// Each S2 Loop becomes one ring. polygol uses [lng, lat] ordering (x, y).
+func s2PolyToGeom(p *s2.Polygon) polygol.Geom {
+	poly := make([][][]float64, p.NumLoops())
+	for i := 0; i < p.NumLoops(); i++ {
+		loop := p.Loop(i)
+		ring := make([][]float64, loop.NumVertices()+1) // +1 to close the ring
+		for j := 0; j < loop.NumVertices(); j++ {
+			ll := s2.LatLngFromPoint(loop.Vertex(j))
+			ring[j] = []float64{ll.Lng.Degrees(), ll.Lat.Degrees()}
+		}
+		// Close the ring by repeating the first vertex
+		ll := s2.LatLngFromPoint(loop.Vertex(0))
+		ring[loop.NumVertices()] = []float64{ll.Lng.Degrees(), ll.Lat.Degrees()}
+		poly[i] = ring
+	}
+	return polygol.Geom{poly}
+}
+
+// geomToS2Poly converts a polygol Geom (MultiPolygon) back to an *s2.Polygon.
+// Each polygon in the MultiPolygon becomes loops in a single S2 Polygon.
+func geomToS2Poly(g polygol.Geom) *s2.Polygon {
+	var loops []*s2.Loop
+	for _, poly := range g {
+		for _, ring := range poly {
+			n := len(ring)
+			if n < 4 { // need at least 3 unique vertices + closing vertex
+				continue
+			}
+			// Drop the closing duplicate vertex
+			pts := make([]s2.Point, n-1)
+			for i := 0; i < n-1; i++ {
+				ll := s2.LatLngFromDegrees(ring[i][1], ring[i][0]) // lat, lng
+				pts[i] = s2.PointFromLatLng(ll)
+			}
+			loop := s2.LoopFromPoints(pts)
+			loop.Normalize()
+			loops = append(loops, loop)
+		}
+	}
+	if len(loops) == 0 {
+		return nil
+	}
+	return s2.PolygonFromLoops(loops)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: subtract already-claimed polygons from a newly created polygon
+// using polygol's exact boolean difference operation.
 // ---------------------------------------------------------------------------
 
 func subtractClaimed(newPoly *s2.Polygon, claimed []*s2.Polygon) *s2.Polygon {
-	rc := s2.NewRegionCoverer()
-	// Defaults are reasonable; tune MaxLevel / MaxCells if precision matters.
-
-	remaining := rc.Covering(newPoly)
-
-	for _, cp := range claimed {
-		claimedCU := rc.Covering(cp)
-		remaining = s2.CellUnionFromDifference(remaining, claimedCU)
+	if len(claimed) == 0 {
+		return newPoly
 	}
 
-	if len(remaining) == 0 {
+	subject := s2PolyToGeom(newPoly)
+
+	clips := make([]polygol.Geom, len(claimed))
+	for i, cp := range claimed {
+		clips[i] = s2PolyToGeom(cp)
+	}
+
+	result, err := polygol.Difference(subject, clips...)
+	if err != nil || len(result) == 0 {
 		return nil
 	}
 
-	// Convert the surviving CellUnion back to a Polygon (one loop per cell).
-	loops := make([]*s2.Loop, len(remaining))
-	for i, cid := range remaining {
-		loops[i] = s2.LoopFromCell(s2.CellFromCellID(cid))
-	}
-	return s2.PolygonFromLoops(loops)
+	return geomToS2Poly(result)
 }
 
 // ---------------------------------------------------------------------------
