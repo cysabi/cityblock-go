@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -170,19 +171,62 @@ func (gs *GameState) pointInAnyClaimed(pt s2.Point) bool {
 // player's lines. Returns the line index, vertex index, and true if found.
 // ---------------------------------------------------------------------------
 
-func findNearbyPoint(player *Player, pt s2.Point, radiusMeters float64) (lineIdx, vertIdx int, found bool) {
+// NearbyResult holds the outcome of a proximity search against a player's lines.
+type NearbyResult struct {
+	LineIdx   int       // which PlayerLine was closest
+	EdgeIdx   int       // which edge on that line
+	SnapPoint s2.Point  // the actual closest point on the edge
+	Timestamp time.Time // the later timestamp of the edge's two endpoints
+}
+
+// findNearbyPoint searches every edge of every player line for the closest
+// point within radiusMeters. It returns the projected point on the edge
+// (not just the nearest vertex) and picks the most-recent match by timestamp.
+func findNearbyPoint(player *Player, pt s2.Point, radiusMeters float64) (result NearbyResult, found bool) {
 	limit := metersToChordAngle(radiusMeters)
+	target := s2.NewMinDistanceToPointTarget(pt)
+	opts := s2.NewClosestEdgeQueryOptions().MaxResults(1).DistanceLimit(limit)
+
 	var bestTime time.Time
 
 	for li, line := range player.Lines {
-		for vi, tp := range line.Points {
-			dist := s2.ChordAngleBetweenPoints(pt, tp.Point)
-			if dist <= limit {
-				if !found || tp.Timestamp.After(bestTime) {
-					lineIdx, vertIdx, found = li, vi, true
-					bestTime = tp.Timestamp
-				}
+		if line.Polyline == nil || line.Polyline.NumEdges() == 0 {
+			continue
+		}
+
+		idx := s2.NewShapeIndex()
+		idx.Add(line.Polyline)
+		idx.Build()
+
+		query := s2.NewClosestEdgeQuery(idx, opts)
+		results := query.FindEdges(target)
+		if len(results) == 0 {
+			continue
+		}
+
+		r := results[0]
+		edgeIdx := int(r.EdgeID())
+		edge := line.Polyline.Edge(edgeIdx)
+
+		// Project pt onto the winning edge to get the exact snap point.
+		snap := s2.Project(pt, edge.V0, edge.V1)
+
+		// The edge spans Points[edgeIdx] → Points[edgeIdx+1].
+		// Use the later timestamp (when the segment was completed).
+		ts := line.Points[edgeIdx].Timestamp
+		if line.Points[edgeIdx+1].Timestamp.After(ts) {
+			ts = line.Points[edgeIdx+1].Timestamp
+		}
+
+		if !found || ts.After(bestTime) {
+			result = NearbyResult{
+				LineIdx:   li,
+				EdgeIdx:   edgeIdx,
+				SnapPoint: snap,
+				Timestamp: ts,
 			}
+			found = true
+			bestTime = ts
 		}
 	}
 	return
@@ -208,44 +252,39 @@ type osrmResponse struct {
 }
 
 func fetchRoute(from, to s2.LatLng) ([]s2.Point, error) {
-	pts := make([]s2.Point, 2)
-	pts = append(pts, s2.PointFromLatLng(from))
-	pts = append(pts, s2.PointFromLatLng(to))
+	url := fmt.Sprintf(
+		"https://router.project-osrm.org/route/v1/foot/%f,%f;%f,%f?overview=full&geometries=geojson",
+		from.Lng.Degrees(), from.Lat.Degrees(),
+		to.Lng.Degrees(), to.Lat.Degrees(),
+	)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("osrm request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("osrm read body: %w", err)
+	}
+
+	var osrm osrmResponse
+	if err := json.Unmarshal(body, &osrm); err != nil {
+		return nil, fmt.Errorf("osrm decode: %w", err)
+	}
+	if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
+		return nil, fmt.Errorf("osrm returned code %s", osrm.Code)
+	}
+
+	coords := osrm.Routes[0].Geometry.Coordinates
+	// Skip the first coordinate (it's the `from` point we already have).
+	pts := make([]s2.Point, 0, len(coords)-1)
+	for i := 1; i < len(coords); i++ {
+		ll := s2.LatLngFromDegrees(coords[i][1], coords[i][0])
+		pts = append(pts, s2.PointFromLatLng(ll))
+	}
 	return pts, nil
-
-	// url := fmt.Sprintf(
-	// 	"https://router.project-osrm.org/route/v1/foot/%f,%f;%f,%f?overview=full&geometries=geojson",
-	// 	from.Lng.Degrees(), from.Lat.Degrees(),
-	// 	to.Lng.Degrees(), to.Lat.Degrees(),
-	// )
-
-	// resp, err := http.Get(url)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("osrm request failed: %w", err)
-	// }
-	// defer resp.Body.Close()
-
-	// body, err := io.ReadAll(resp.Body)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("osrm read body: %w", err)
-	// }
-
-	// var osrm osrmResponse
-	// if err := json.Unmarshal(body, &osrm); err != nil {
-	// 	return nil, fmt.Errorf("osrm decode: %w", err)
-	// }
-	// if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
-	// 	return nil, fmt.Errorf("osrm returned code %s", osrm.Code)
-	// }
-
-	// coords := osrm.Routes[0].Geometry.Coordinates
-	// // Skip the first coordinate (it's the `from` point we already have).
-	// pts := make([]s2.Point, 0, len(coords)-1)
-	// for i := 1; i < len(coords); i++ {
-	// 	ll := s2.LatLngFromDegrees(coords[i][1], coords[i][0])
-	// 	pts = append(pts, s2.PointFromLatLng(ll))
-	// }
-	// return pts, nil
 }
 
 // joinViaRoute extends a PlayerLine to a destination by fetching an OSRM
@@ -255,17 +294,19 @@ func joinViaRoute(line *PlayerLine, dest s2.Point, ts time.Time) error {
 		return fmt.Errorf("line has no points")
 	}
 
-	fromLL := s2.LatLngFromPoint(line.Points[len(line.Points)-1].Point)
-	toLL := s2.LatLngFromPoint(dest)
+	// fromLL := s2.LatLngFromPoint(line.Points[len(line.Points)-1].Point)
+	// toLL := s2.LatLngFromPoint(dest)
 
-	routePts, err := fetchRoute(fromLL, toLL)
-	if err != nil {
-		return err
-	}
+	line.Points = append(line.Points, TimestampedPoint{Point: dest, Timestamp: ts})
 
-	for _, rp := range routePts {
-		line.Points = append(line.Points, TimestampedPoint{Point: rp, Timestamp: ts})
-	}
+	// routePts, err := fetchRoute(fromLL, toLL)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// for _, rp := range routePts {
+	// 	line.Points = append(line.Points, TimestampedPoint{Point: rp, Timestamp: ts})
+	// }
 	line.rebuildPolyline()
 	return nil
 }
@@ -549,7 +590,7 @@ func (gs *GameState) ReceivePing(playerID string, lat, lng float64, ts time.Time
 	}
 
 	// ---- 2. Find the most-recent nearby point within 20 m. ----------------
-	lineIdx, vertIdx, found := findNearbyPoint(player, pt, NearbyRadius)
+	nearby, found := findNearbyPoint(player, pt, NearbyRadius)
 
 	if !found {
 		// ---- 3a. No nearby point → start a brand-new polyline. -------------
@@ -563,8 +604,8 @@ func (gs *GameState) ReceivePing(playerID string, lat, lng float64, ts time.Time
 	}
 
 	// ---- 3b. Nearby point found → join to it via OSRM route. --------------
+	lineIdx := nearby.LineIdx
 	line := player.Lines[lineIdx]
-	_ = vertIdx // The nearby point identifies the line; we extend from its tip.
 
 	oldEdgeCount := 0
 	if line.Polyline != nil {
