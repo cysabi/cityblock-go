@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -214,39 +213,39 @@ func fetchRoute(from, to s2.LatLng) ([]s2.Point, error) {
 	pts = append(pts, s2.PointFromLatLng(to))
 	return pts, nil
 
-	url := fmt.Sprintf(
-		"https://router.project-osrm.org/route/v1/foot/%f,%f;%f,%f?overview=full&geometries=geojson",
-		from.Lng.Degrees(), from.Lat.Degrees(),
-		to.Lng.Degrees(), to.Lat.Degrees(),
-	)
+	// url := fmt.Sprintf(
+	// 	"https://router.project-osrm.org/route/v1/foot/%f,%f;%f,%f?overview=full&geometries=geojson",
+	// 	from.Lng.Degrees(), from.Lat.Degrees(),
+	// 	to.Lng.Degrees(), to.Lat.Degrees(),
+	// )
 
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("osrm request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	// resp, err := http.Get(url)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("osrm request failed: %w", err)
+	// }
+	// defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("osrm read body: %w", err)
-	}
+	// body, err := io.ReadAll(resp.Body)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("osrm read body: %w", err)
+	// }
 
-	var osrm osrmResponse
-	if err := json.Unmarshal(body, &osrm); err != nil {
-		return nil, fmt.Errorf("osrm decode: %w", err)
-	}
-	if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
-		return nil, fmt.Errorf("osrm returned code %s", osrm.Code)
-	}
+	// var osrm osrmResponse
+	// if err := json.Unmarshal(body, &osrm); err != nil {
+	// 	return nil, fmt.Errorf("osrm decode: %w", err)
+	// }
+	// if osrm.Code != "Ok" || len(osrm.Routes) == 0 {
+	// 	return nil, fmt.Errorf("osrm returned code %s", osrm.Code)
+	// }
 
-	coords := osrm.Routes[0].Geometry.Coordinates
-	// Skip the first coordinate (it's the `from` point we already have).
-	pts := make([]s2.Point, 0, len(coords)-1)
-	for i := 1; i < len(coords); i++ {
-		ll := s2.LatLngFromDegrees(coords[i][1], coords[i][0])
-		pts = append(pts, s2.PointFromLatLng(ll))
-	}
-	return pts, nil
+	// coords := osrm.Routes[0].Geometry.Coordinates
+	// // Skip the first coordinate (it's the `from` point we already have).
+	// pts := make([]s2.Point, 0, len(coords)-1)
+	// for i := 1; i < len(coords); i++ {
+	// 	ll := s2.LatLngFromDegrees(coords[i][1], coords[i][0])
+	// 	pts = append(pts, s2.PointFromLatLng(ll))
+	// }
+	// return pts, nil
 }
 
 // joinViaRoute extends a PlayerLine to a destination by fetching an OSRM
