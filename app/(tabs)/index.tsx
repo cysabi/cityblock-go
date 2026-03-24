@@ -1,7 +1,6 @@
 import { useBackgroundLocation } from "@/hooks/use-location";
 import {
   Camera,
-  FillLayer,
   LineLayer,
   MapView,
   ShapeSource,
@@ -196,16 +195,3 @@ export default function HomeScreen() {
     </MapView>
   );
 }
-
-/*
-// TODO: Only fill in claimed shapes
-
-<FillLayer
-  id="routeShape"
-  style={{
-    fillColor: "#DA3E15",
-    fillOpacity: 0.5,
-  }}
-/>
-
-*/
