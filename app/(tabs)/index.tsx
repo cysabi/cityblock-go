@@ -73,7 +73,7 @@ export default function HomeScreen() {
   const [points, setPoints] = useState<[number, number][]>([]);
 
   // claimed shapes
-  const [claimedShapes, setClaimedShapes] = useState<[number, number][]>([]);
+  const [claimedShapes, setClaimedShapes] = useState<[number, number][][]>([]);
 
   const [mapState, setMapState] = useState({});
 
@@ -93,15 +93,19 @@ export default function HomeScreen() {
     },
   };
 
+  // TODO: Array of shapesGeoJSON
   // Build a GeoJSON LineString from the collected claimed shapes
-  const shapesGeoJSON: GeoJSON.Feature<GeoJSON.LineString> = {
-    type: "Feature", // now inferred as literal 'Feature', not string
-    properties: {},
-    geometry: {
-      type: "LineString", // same here
-      coordinates: claimedShapes,
-    },
-  };
+  const allShapesGeoJSON: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+  for (const shape of claimedShapes) {
+    allShapesGeoJSON.push({
+      type: "Feature", // now inferred as literal 'Feature', not string
+      properties: {},
+      geometry: {
+        type: "LineString", // same here
+        coordinates: shape,
+      },
+    });
+  }
 
   async function fetchState() {
     try {
@@ -122,9 +126,9 @@ export default function HomeScreen() {
       }
       setPoints(allLines);
 
-      const allShapes: [number, number][] = [];
+      const allShapes: [number, number][][] = [];
       for (const loop of linesAndLoops.loops) {
-        allShapes.push(...loop);
+        allShapes.push(loop);
       }
       setClaimedShapes(allShapes);
     } catch (error) {
@@ -160,6 +164,8 @@ export default function HomeScreen() {
     console.log("-- update location " + new Date().toLocaleTimeString() + "--");
     if (location) {
       setCoords([location.coords.longitude, location.coords.latitude]);
+
+      // Uncomment this to render a point locally/on the client, without the server
       // addPoint(location.coords.longitude, location.coords.latitude);
 
       // Send to server - longitude and latitude
@@ -169,12 +175,8 @@ export default function HomeScreen() {
     }
   }, [location]);
 
-  console.log(mapState);
-
   if (status === "starting") return <ActivityIndicator style={{ flex: 1 }} />;
   if (status === "error") return <Text>{error}</Text>;
-
-  console.log(coords[0], coords[1]);
 
   return (
     <MapView
@@ -202,17 +204,18 @@ export default function HomeScreen() {
           />
         </ShapeSource>
       )}
-      {claimedShapes.length >= 1 && (
-        <ShapeSource id="route" shape={shapesGeoJSON}>
-          <FillLayer
-            id="routeShape"
-            style={{
-              fillColor: "#DA3E15",
-              fillOpacity: 0.4,
-            }}
-          />
-        </ShapeSource>
-      )}
+      {allShapesGeoJSON.length >= 1 &&
+        allShapesGeoJSON.map((shape, index) => (
+          <ShapeSource id="route" key={index} shape={shape}>
+            <FillLayer
+              id="routeShape"
+              style={{
+                fillColor: "#DA3E15",
+                fillOpacity: 0.4,
+              }}
+            />
+          </ShapeSource>
+        ))}
     </MapView>
   );
 }
