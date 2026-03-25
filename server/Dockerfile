@@ -14,8 +14,8 @@ RUN go mod download
 COPY *.go .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux go build -v -o /server
+RUN CGO_ENABLED=0 GOOS=linux go build -v -o /geogo
 
 EXPOSE 9090
 
-CMD ["/server"]
+CMD ["/geogo"]
