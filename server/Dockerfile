@@ -2,6 +2,8 @@
 
 FROM golang:1.24-alpine
 
+RUN apk add --no-cache gcc musl-dev geos-dev
+
 # Set destination for COPY
 WORKDIR /app
 
@@ -14,7 +16,7 @@ RUN go mod download
 COPY *.go .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux go build -v -o /geogo
+RUN CGO_ENABLED=1 GOOS=linux go build -v -o /geogo
 
 EXPOSE 9090
 

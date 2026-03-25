@@ -1,4 +1,4 @@
-module geogo/server
+module github.com/cysabi/geogo
 
 go 1.26.1
 
