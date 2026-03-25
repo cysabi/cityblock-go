@@ -15,9 +15,12 @@ type Point = { lat: number; lng: number };
 
 type Player = {
   id: string;
+  name: string;
   team: string;
-  lines: { points: Point[] }[] | null;
-  claimed: { loops: Point[][] }[] | null;
+  city: string;
+  lastPoint: Point[];
+  trail: Point[][] | null;
+  claimed: Point[][] | null;
 };
 
 type GameState = {
@@ -38,18 +41,16 @@ const extractLinesAndLoops = (data: GameState): ExtractedData => {
 
   for (const player of data.players) {
     // Extract lines
-    if (player.lines) {
-      for (const line of player.lines) {
-        lines.push(line.points.map(toCoord));
+    if (player.trail) {
+      for (const trail of player.trail) {
+        lines.push(trail.map(toCoord));
       }
     }
 
     // Extract loops
     if (player.claimed) {
       for (const claim of player.claimed) {
-        for (const loop of claim.loops) {
-          loops.push(loop.map(toCoord));
-        }
+        loops.push(claim.map(toCoord));
       }
     }
   }
@@ -59,7 +60,12 @@ const extractLinesAndLoops = (data: GameState): ExtractedData => {
 
 export default function HomeScreen() {
   //const SERVER_URL = "http://10.100.1.50:8080"; // RC
-  const SERVER_URL = "http://192.168.1.28:8080"; // RC
+  //const SERVER_URL = "http://192.168.1.28:8080"; // Home
+  const SERVER_URL = "http://10.100.19.188:9090"; // Cyrene
+  //const SERVER_URL = "https://geogo.rcdis.co/";
+
+  const LOBBY_ID = "test12";
+  const PLAYER_ID = "ebf22b7d-1b2f-433f-8402-118f8d8dbf56";
 
   const userId = "alice"; // TODO: Determine based on device
 
@@ -75,7 +81,7 @@ export default function HomeScreen() {
   // claimed shapes
   const [claimedShapes, setClaimedShapes] = useState<[number, number][][]>([]);
 
-  const [mapState, setMapState] = useState({});
+  //const [mapState, setMapState] = useState({});
 
   // Call this every ~10s with the new GPS coordinate
   // For use live updating on client
@@ -109,16 +115,14 @@ export default function HomeScreen() {
 
   async function fetchState() {
     try {
-      const response = await fetch(SERVER_URL + "/state");
+      const response = await fetch(SERVER_URL + "/state?lobby=" + LOBBY_ID);
       const json = await response.json();
-      console.log(JSON.stringify(json));
-      setMapState(json);
 
       // Render lines and shapes - could be a separate function
       // for each lines, extract from .points [lng, lat]
       const linesAndLoops = extractLinesAndLoops(json);
-      console.log(JSON.stringify("--- lines and loops ---"));
-      console.log(JSON.stringify(linesAndLoops));
+      //console.log(JSON.stringify("--- lines and loops ---"));
+      //console.log(JSON.stringify(linesAndLoops));
 
       const allLines: [number, number][] = [];
       for (const line of linesAndLoops.lines) {
@@ -132,31 +136,27 @@ export default function HomeScreen() {
       }
       setClaimedShapes(allShapes);
     } catch (error) {
-      console.error("Error fetching data:", error);
+      console.error("Error fetching data - fetchState:", error);
     }
   }
 
   async function pingLocation(lat: number, lng: number) {
     try {
-      const url =
-        SERVER_URL +
-        "/ping?lat=" +
-        lat +
-        "&lng=" +
-        lng +
-        "&player_id=" +
-        userId;
+      const data = { lobby: LOBBY_ID, player: PLAYER_ID, points: [[lng, lat]] };
 
-      const response = await fetch(url, {
+      const response = await fetch(SERVER_URL + "/ping", {
         method: "POST", // Specify the method
         headers: {
           "Content-Type": "application/json", // Inform the server about the body format
         },
+        body: JSON.stringify(data),
       });
-      const json = await response.json();
+      const json = await response.text();
+
+      console.log("--- ping location response ---");
       console.log(json);
     } catch (error) {
-      console.error("Error fetching data:", error);
+      console.error("Error fetching data - pingLocation:", error);
     }
   }
 
