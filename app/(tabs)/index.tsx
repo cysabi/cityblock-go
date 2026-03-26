@@ -67,13 +67,12 @@ const extractLinesAndLoops = (data: GameState): ExtractedData => {
 export default function HomeScreen() {
   //const SERVER_URL = "http://10.100.1.50:8080"; // RC
   //const SERVER_URL = "http://192.168.1.28:8080"; // Home
-  const SERVER_URL = "http://10.100.19.188:9090"; // Cyrene
-  //const SERVER_URL = "https://geogo.rcdis.co/";
+  //const SERVER_URL = "http://10.100.19.188:9090"; // Cyrene
+  const SERVER_URL = "https://geogo.rcdis.co";
 
   const LOBBY_ID = "test12";
   const PLAYER_ID = "ebf22b7d-1b2f-433f-8402-118f8d8dbf56";
-
-  const userId = "alice"; // TODO: Determine based on device
+  // TODO: Determine based on device
 
   const { location, status, error } = useBackgroundLocation();
 
