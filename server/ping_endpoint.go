@@ -46,7 +46,7 @@ func PingEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	var player *Player
 	for _, p := range game.Players {
-		if p.ID == req.Player {
+		if p.Tag == req.Player {
 			player = p
 			break
 		}
@@ -168,7 +168,7 @@ func claimHoles(game *Game, player *Player) {
 
 	// subtract from opponents
 	for _, opponent := range game.Players {
-		if opponent.ID == player.ID {
+		if opponent.Tag == player.Tag {
 			continue
 		}
 		if opponent.Trail != nil {

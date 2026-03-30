@@ -7,13 +7,12 @@ import (
 )
 
 type Game struct {
-	Colors  []string  `json:"colors"`
+	Colors  [2]string `json:"colors"`
 	Players []*Player `json:"players"`
 }
 
 type Player struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
+	Tag         string      `json:"tag"`
 	Team        string      `json:"team"`
 	City        string      `json:"city"`
 	LatestPoint *[2]float64 `json:"lastPoint"`

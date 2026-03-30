@@ -19,8 +19,7 @@ type GameResponse struct {
 }
 
 type PlayerResponse struct {
-	ID          string           `json:"id"`
-	Name        string           `json:"name"`
+	Tag         string           `json:"tag"`
 	Team        string           `json:"team"`
 	City        string           `json:"city"`
 	LatestPoint *[2]float64      `json:"lastPoint"`
@@ -88,7 +87,7 @@ func TestFlow(t *testing.T) {
 		for _, p := range game.Players {
 			for _, poly := range p.Claimed {
 				features = append(features, feature("Polygon", poly, map[string]any{
-					"type": "claimed", "player": p.ID,
+					"type": "claimed", "player": p.Tag,
 					"stroke": "#9b59b6", "stroke-width": 2, "fill": "#9b59b6", "fill-opacity": 0.25,
 				}))
 			}
@@ -98,7 +97,7 @@ func TestFlow(t *testing.T) {
 		for _, p := range game.Players {
 			for _, poly := range p.Trail {
 				features = append(features, feature("Polygon", poly, map[string]any{
-					"type": "trail", "player": p.ID,
+					"type": "trail", "player": p.Tag,
 					"stroke": "#2ecc71", "stroke-width": 2, "fill": "#2ecc71", "fill-opacity": 0.15,
 				}))
 			}
@@ -124,7 +123,7 @@ func TestFlow(t *testing.T) {
 		for _, p := range game.Players {
 			if p.LatestPoint != nil {
 				features = append(features, feature("Point", p.LatestPoint, map[string]any{
-					"type": "latestPoint", "player": p.ID,
+					"type": "latestPoint", "player": p.Tag,
 					"marker-color": "#f39c12", "marker-size": "medium",
 				}))
 			}
@@ -146,7 +145,7 @@ func TestFlow(t *testing.T) {
 		// figure out what OSRM input the server will use
 		var latestPoint *[2]float64
 		for _, p := range before.Players {
-			if p.ID == player {
+			if p.Tag == player {
 				latestPoint = p.LatestPoint
 				break
 			}
@@ -168,7 +167,7 @@ func TestFlow(t *testing.T) {
 	}
 
 	// --- join ---
-	joinBody, _ := json.Marshal(JoinRequest{Player: "test", Name: "tester", City: "nyc"})
+	joinBody, _ := json.Marshal(JoinRequest{Player: "test", City: "nyc"})
 	joinResp, err := http.Post(srv.URL+"/join", "application/json", bytes.NewReader(joinBody))
 	if err != nil {
 		t.Fatal(err)

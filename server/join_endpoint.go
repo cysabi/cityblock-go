@@ -8,11 +8,11 @@ import (
 )
 
 type JoinRequest struct {
-	Lobby  string `json:"lobby"`
-	Player string `json:"player"`
-	Name   string `json:"name"`
-	Team   string `json:"team"`
-	City   string `json:"city"`
+	Lobby  string    `json:"lobby"`
+	Colors [2]string `json:"colors"`
+	Player string    `json:"player"`
+	Team   string    `json:"team"`
+	City   string    `json:"city"`
 }
 
 func newLobbyCode() string {
@@ -28,7 +28,7 @@ func JoinEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Player == "" {
-		http.Error(w, "player is required", http.StatusBadRequest)
+		http.Error(w, "player tag is required", http.StatusBadRequest)
 		return
 	}
 
@@ -38,7 +38,7 @@ func JoinEndpoint(w http.ResponseWriter, r *http.Request) {
 	// create lobby if none specified
 	if req.Lobby == "" {
 		req.Lobby = newLobbyCode()
-		lobbies[req.Lobby] = &Game{}
+		lobbies[req.Lobby] = &Game{Colors: req.Colors}
 	}
 	game, ok := lobbies[req.Lobby]
 	if !ok {
@@ -49,16 +49,15 @@ func JoinEndpoint(w http.ResponseWriter, r *http.Request) {
 	// find or create player
 	var player *Player
 	for _, p := range game.Players {
-		if p.ID == req.Player {
+		if p.Tag == req.Player {
 			player = p
 			break
 		}
 	}
 	if player == nil {
-		player = &Player{ID: req.Player}
+		player = &Player{Tag: req.Player}
 		game.Players = append(game.Players, player)
 	}
-	player.Name = req.Name
 	player.Team = req.Team
 	player.City = req.City
 
