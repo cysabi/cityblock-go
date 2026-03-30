@@ -36,11 +36,11 @@ func PingEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lobbiesMu.Lock()
-	defer lobbiesMu.Unlock()
 
 	// get game & player
 	game := lobbies[req.Lobby]
 	if game == nil {
+		lobbiesMu.Unlock()
 		http.Error(w, "lobby not found", http.StatusNotFound)
 		return
 	}
@@ -52,19 +52,29 @@ func PingEndpoint(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if player == nil {
+		lobbiesMu.Unlock()
 		http.Error(w, "player not found", http.StatusNotFound)
 		return
 	}
 
-	if err := updatePlayerState(game, player, req.Points); err != nil {
+	affected, err := updatePlayerState(game, player, req.Points)
+	if err != nil {
+		lobbiesMu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Serialize updates while still holding the lock
+	messages := PreparePlayerUpdates(req.Lobby, affected)
+	lobbiesMu.Unlock()
+
+	// Broadcast after releasing the lock
+	go BroadcastPrepared(req.Lobby, messages)
+
 	json.NewEncoder(w).Encode(nil)
 }
 
-func updatePlayerState(game *Game, p *Player, points [][2]float64) error {
+func updatePlayerState(game *Game, p *Player, points [][2]float64) ([]string, error) {
 	first := points[0]
 	continuing := pointsWithinMeters(p.LatestPoint, &first, 1000, p.City)
 
@@ -80,20 +90,20 @@ func updatePlayerState(game *Game, p *Player, points [][2]float64) error {
 		// single point, not continuing — just update LatestPoint
 		last := points[len(points)-1]
 		p.LatestPoint = &last
-		return nil
+		return []string{p.Tag}, nil
 	}
 
 	fmt.Printf("B: %#v\n", raw)
 
 	segment := raw
-	segment, err := snapToRoads(raw)
-	if err != nil {
-		return err
-	}
+	// segment, err := snapToRoads(raw)
+	// if err != nil {
+	// 	return nil, err
+	// }
 	if len(segment) < 2 {
 		last := points[len(points)-1]
 		p.LatestPoint = &last
-		return nil
+		return []string{p.Tag}, nil
 	}
 
 	fmt.Printf("C: %#v\n", segment)
@@ -116,16 +126,17 @@ func updatePlayerState(game *Game, p *Player, points [][2]float64) error {
 	p.LatestPoint = &last
 
 	// detect holes in trail → claim enclosed areas
-	claimHoles(game, p)
+	affected := []string{p.Tag}
+	affected = append(affected, claimHoles(game, p)...)
 
-	return nil
+	return affected, nil
 }
 
 // claimHoles finds interior rings (holes) in the player's Trail,
 // buffers them, claims them as territory, and subtracts from Trail.
-func claimHoles(game *Game, player *Player) {
+func claimHoles(game *Game, player *Player) []string {
 	if player.Trail == nil {
-		return
+		return nil
 	}
 
 	var holes []*geos.Geom
@@ -140,7 +151,7 @@ func claimHoles(game *Game, player *Player) {
 	}
 
 	if len(holes) == 0 {
-		return
+		return nil
 	}
 
 	// union all holes into one claimed area
@@ -167,6 +178,7 @@ func claimHoles(game *Game, player *Player) {
 	}
 
 	// subtract from opponents
+	var affected []string
 	for _, opponent := range game.Players {
 		if opponent.Tag == player.Tag {
 			continue
@@ -183,7 +195,9 @@ func claimHoles(game *Game, player *Player) {
 				opponent.Claimed = nil
 			}
 		}
+		affected = append(affected, opponent.Tag)
 	}
+	return affected
 }
 
 func snapToRoads(points [][2]float64) ([][2]float64, error) {

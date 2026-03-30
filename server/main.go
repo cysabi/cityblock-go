@@ -31,6 +31,7 @@ func main() {
 	r.Post("/ping", PingEndpoint)
 	r.Post("/join", JoinEndpoint)
 	r.Get("/state", StateEndpoint)
+	r.Get("/ws", WSEndpoint)
 
 	log.Println("listening on :9090")
 	log.Fatal(http.ListenAndServe(":9090", r))
