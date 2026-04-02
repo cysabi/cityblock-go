@@ -1,0 +1,17 @@
+services:
+  osrm:
+    image: osrm/osrm-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osrm-data:/data
+    command: osrm-routed --algorithm mld /data/map.osrm
+
+  geogo:
+    build: .
+    ports:
+      - "9090:9090"
+    environment:
+      - OSRM_URL=http://osrm:5000
+    depends_on:
+      - osrm

@@ -49,16 +49,15 @@ function Map({ state, playerTag, sendPoint }: { state: GameState | null; playerT
         const color = state.colors[state.colors.indexOf(player.team)] ?? "#DA3E15";
         return (
           <React.Fragment key={player.tag}>
-            {player.trail && (
+            {player.trail?.length && (
               <ShapeSource id={`trail-${player.tag}`} shape={{
                 type: "Feature", properties: {},
-                geometry: { type: "MultiPolygon", coordinates: player.trail },
+                geometry: { type: "MultiLineString", coordinates: player.trail },
               }}>
-                <FillLayer id={`trailFill-${player.tag}`} style={{ fillColor: color, fillOpacity: 0.1 }} />
-                <LineLayer id={`trailLine-${player.tag}`} style={{ lineColor: color, lineWidth: 2, lineOpacity: 0.6 }} />
+                <LineLayer id={`trailLine-${player.tag}`} style={{ lineColor: color, lineWidth: 3, lineOpacity: 0.7 }} />
               </ShapeSource>
             )}
-            {player.claimed && (
+            {player.claimed?.length && (
               <ShapeSource id={`claimed-${player.tag}`} shape={{
                 type: "Feature", properties: {},
                 geometry: { type: "MultiPolygon", coordinates: player.claimed },

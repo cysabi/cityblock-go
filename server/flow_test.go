@@ -23,7 +23,7 @@ type PlayerResponse struct {
 	Team        string           `json:"team"`
 	City        string           `json:"city"`
 	LatestPoint *[2]float64      `json:"lastPoint"`
-	Trail       [][][][2]float64 `json:"trail"`
+	Trail       [][][2]float64   `json:"trail"`
 	Claimed     [][][][2]float64 `json:"claimed"`
 }
 
@@ -93,12 +93,12 @@ func TestFlow(t *testing.T) {
 			}
 		}
 
-		// state: trail polygons (green)
+		// state: trail lines (green)
 		for _, p := range game.Players {
-			for _, poly := range p.Trail {
-				features = append(features, feature("Polygon", poly, map[string]any{
+			for _, line := range p.Trail {
+				features = append(features, feature("LineString", line, map[string]any{
 					"type": "trail", "player": p.Tag,
-					"stroke": "#2ecc71", "stroke-width": 2, "fill": "#2ecc71", "fill-opacity": 0.15,
+					"stroke": "#2ecc71", "stroke-width": 3,
 				}))
 			}
 		}
@@ -142,24 +142,22 @@ func TestFlow(t *testing.T) {
 		t.Helper()
 		before := getState(lobby)
 
-		// figure out what OSRM input the server will use
-		var latestPoint *[2]float64
+		// prepend LatestPoint like the server does
+		osrmInput := points
 		for _, p := range before.Players {
-			if p.Tag == player {
-				latestPoint = p.LatestPoint
+			if p.Tag == player && p.LatestPoint != nil {
+				osrmInput = append([][2]float64{*p.LatestPoint}, points...)
 				break
 			}
 		}
-		continuing := pointsWithinMeters(latestPoint, &points[0], 1000, "nyc")
-		osrmInput := points
-		if continuing && latestPoint != nil {
-			osrmInput = append([][2]float64{*latestPoint}, points...)
-		}
 
-		// call OSRM ourselves to get the route for visualization
+		// call OSRM ourselves to get the routes for visualization
 		var route [][2]float64
 		if len(osrmInput) >= 2 {
-			route, _ = snapToRoads(osrmInput)
+			segments, _ := snapToRoads(osrmInput)
+			for _, seg := range segments {
+				route = append(route, seg...)
+			}
 		}
 
 		doPing(lobby, player, points)

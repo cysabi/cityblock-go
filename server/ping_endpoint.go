@@ -3,13 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 
 	"github.com/twpayne/go-geos"
 )
-
-const TRAIL_WIDTH = 4
 
 type PingRequest struct {
 	Lobby  string       `json:"lobby"`
@@ -20,6 +17,7 @@ type PingRequest struct {
 // PingEndpoint receives location pings from a client and updates game state.
 // POST /ping { lobby, player, points }
 func PingEndpoint(w http.ResponseWriter, r *http.Request) {
+	// validate request
 	w.Header().Set("Content-Type", "application/json")
 	var req PingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -57,6 +55,7 @@ func PingEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// update player state
 	affected, err := updatePlayerState(game, player, req.Points)
 	if err != nil {
 		lobbiesMu.Unlock()
@@ -64,65 +63,45 @@ func PingEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serialize updates while still holding the lock
+	// emit to ws
 	messages := PreparePlayerUpdates(req.Lobby, affected)
 	lobbiesMu.Unlock()
 
-	// Broadcast after releasing the lock
 	go BroadcastPrepared(req.Lobby, messages)
 
 	json.NewEncoder(w).Encode(nil)
 }
 
 func updatePlayerState(game *Game, p *Player, points [][2]float64) ([]string, error) {
-	first := points[0]
-	continuing := pointsWithinMeters(p.LatestPoint, &first, 1000, p.City)
-
-	fmt.Printf("A: %#v\n", points)
-
-	// build the segment to snap
-	var raw [][2]float64
-	if continuing {
-		raw = append([][2]float64{*p.LatestPoint}, points...)
-	} else if len(points) >= 2 {
-		raw = points
+	// prepend LatestPoint so OSRM can connect to previous position
+	if p.LatestPoint != nil {
+		points = append([][2]float64{*p.LatestPoint}, points...)
 	} else {
-		// single point, not continuing — just update LatestPoint
-		last := points[len(points)-1]
-		p.LatestPoint = &last
+		p.LatestPoint = &points[len(points)-1]
 		return []string{p.Tag}, nil
 	}
 
-	fmt.Printf("B: %#v\n", raw)
-
-	segment := raw
-	// segment, err := snapToRoads(raw)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	if len(segment) < 2 {
-		last := points[len(points)-1]
-		p.LatestPoint = &last
-		return []string{p.Tag}, nil
+	// snap to roads
+	segments, err := snapToRoads(points)
+	if err != nil {
+		return nil, err
 	}
 
-	fmt.Printf("C: %#v\n", segment)
-
-	// buffer the segment and union into trail
-	line := geos.NewLineString(toGeosCoords(segment))
-	bufDeg := metersToDeg(TRAIL_WIDTH, true, p.City)
-	strip := line.Buffer(bufDeg, 8)
-
-	if p.Trail == nil {
-		p.Trail = strip
-	} else {
-		p.Trail = p.Trail.Union(strip)
+	// add each matching as a line to the trail
+	for _, seg := range segments {
+		if len(seg) < 2 {
+			continue
+		}
+		line := geos.NewLineString(toGeosCoords(seg))
+		if p.Trail == nil {
+			p.Trail = geos.NewCollection(geos.TypeIDMultiLineString, []*geos.Geom{line})
+		} else {
+			p.Trail = p.Trail.Union(line).UnaryUnion()
+		}
 	}
 
-	fmt.Printf("D: %#v\n", strip)
-
-	// update LatestPoint from snapped segment
-	last := segment[len(segment)-1]
+	// update LatestPoint from last matching
+	last := points[len(points)-1]
 	p.LatestPoint = &last
 
 	// detect holes in trail → claim enclosed areas
@@ -132,50 +111,26 @@ func updatePlayerState(game *Game, p *Player, points [][2]float64) ([]string, er
 	return affected, nil
 }
 
-// claimHoles finds interior rings (holes) in the player's Trail,
-// buffers them, claims them as territory, and subtracts from Trail.
 func claimHoles(game *Game, player *Player) []string {
 	if player.Trail == nil {
 		return nil
 	}
 
-	var holes []*geos.Geom
-	for i := range player.Trail.NumGeometries() {
-		poly := player.Trail.Geometry(i)
-		for j := range poly.NumInteriorRings() {
-			ring := poly.InteriorRing(j)
-			hole := geos.NewPolygon([][][]float64{ring.CoordSeq().ToCoords()})
-			bufDeg := metersToDeg(10, true, player.City)
-			holes = append(holes, hole.Buffer(bufDeg, 8))
-		}
-	}
-
-	if len(holes) == 0 {
+	// get claimed areas
+	claimed, cuts, dangles, _ := player.Trail.PolygonizeFull()
+	if claimed.IsEmpty() {
 		return nil
-	}
-
-	// union all holes into one claimed area
-	var newClaimed *geos.Geom
-	for _, h := range holes {
-		if newClaimed == nil {
-			newClaimed = h
-		} else {
-			newClaimed = newClaimed.Union(h)
-		}
 	}
 
 	// add to player's claimed territory
 	if player.Claimed == nil {
-		player.Claimed = newClaimed
+		player.Claimed = claimed
 	} else {
-		player.Claimed = player.Claimed.Union(newClaimed)
+		player.Claimed = player.Claimed.Union(claimed)
 	}
 
-	// subtract claimed area from player's trail
-	player.Trail = player.Trail.Difference(newClaimed)
-	if player.Trail.IsEmpty() {
-		player.Trail = nil
-	}
+	// trail becomes only the leftover lines (cuts + dangles)
+	player.Trail = geos.NewCollection(geos.TypeIDGeometryCollection, []*geos.Geom{cuts, dangles}).UnaryUnion()
 
 	// subtract from opponents
 	var affected []string
@@ -184,23 +139,39 @@ func claimHoles(game *Game, player *Player) []string {
 			continue
 		}
 		if opponent.Trail != nil {
-			opponent.Trail = opponent.Trail.Difference(newClaimed)
-			if opponent.Trail.IsEmpty() {
-				opponent.Trail = nil
-			}
+			opponent.Trail = viralSubtract(opponent.Trail, claimed)
 		}
 		if opponent.Claimed != nil {
-			opponent.Claimed = opponent.Claimed.Difference(newClaimed)
-			if opponent.Claimed.IsEmpty() {
-				opponent.Claimed = nil
-			}
+			opponent.Claimed = opponent.Claimed.Difference(claimed)
 		}
 		affected = append(affected, opponent.Tag)
 	}
 	return affected
 }
 
-func snapToRoads(points [][2]float64) ([][2]float64, error) {
+func viralSubtract(trail, claimed *geos.Geom) *geos.Geom {
+	trail = trail.Difference(claimed)
+	infected := claimed
+	for {
+		var keep []*geos.Geom
+		spread := false
+		for i := range trail.NumGeometries() {
+			line := trail.Geometry(i)
+			if line.Intersects(infected) {
+				infected = infected.Union(line)
+				spread = true
+			} else {
+				keep = append(keep, line)
+			}
+		}
+		if !spread || len(keep) == 0 {
+			return trail
+		}
+		trail = geos.NewCollection(geos.TypeIDMultiLineString, keep)
+	}
+}
+
+func snapToRoads(points [][2]float64) ([][][2]float64, error) {
 	coords := ""
 	for i, p := range points {
 		if i > 0 {
@@ -230,32 +201,11 @@ func snapToRoads(points [][2]float64) ([][2]float64, error) {
 		return nil, err
 	}
 	if len(result.Matchings) == 0 {
-		return points, nil
+		return [][][2]float64{points}, nil
 	}
-	return result.Matchings[0].Geometry.Coordinates, nil
-}
-
-func pointsWithinMeters(a, b *[2]float64, m float64, city string) bool {
-	if a == nil || b == nil {
-		return false
+	segments := make([][][2]float64, len(result.Matchings))
+	for i, m := range result.Matchings {
+		segments[i] = m.Geometry.Coordinates
 	}
-	ptA, ptB := geos.NewPointFromXY(a[0], a[1]), geos.NewPointFromXY(b[0], b[1])
-	if !ptA.DistanceWithin(ptB, metersToDeg(m, true, city)) {
-		return false
-	}
-	return math.Abs(a[1]-b[1]) < metersToDeg(m, false, city)
-}
-
-func metersToDeg(m float64, lng bool, city string) float64 {
-	if !lng {
-		return m / 111_000
-	}
-	switch city {
-	case "london":
-		return m / 69_400
-	case "shanghai":
-		return m / 95_000
-	default: // nyc
-		return m / 84_400
-	}
+	return segments, nil
 }

@@ -16,7 +16,7 @@ type Player struct {
 	Team        string      `json:"team"`
 	City        string      `json:"city"`
 	LatestPoint *[2]float64 `json:"lastPoint"`
-	Trail       *geos.Geom  `json:"-"` // MultiPolygon — buffered road segments
+	Trail       *geos.Geom  `json:"-"` // MultiLineString — raw road segments
 	Claimed     *geos.Geom  `json:"-"` // MultiPolygon — enclosed territory
 }
 
@@ -24,13 +24,25 @@ func (p *Player) MarshalJSON() ([]byte, error) {
 	type Alias Player
 	return json.Marshal(&struct {
 		*Alias
-		Trail   [][][][2]float64 `json:"trail"`
+		Trail   [][][2]float64   `json:"trail"`
 		Claimed [][][][2]float64 `json:"claimed"`
 	}{
 		Alias:   (*Alias)(p),
-		Trail:   multiPolygonCoords(p.Trail),
+		Trail:   multiLineStringCoords(p.Trail),
 		Claimed: multiPolygonCoords(p.Claimed),
 	})
+}
+
+func multiLineStringCoords(geom *geos.Geom) [][][2]float64 {
+	if geom == nil {
+		return nil
+	}
+	var result [][][2]float64
+	for i := range geom.NumGeometries() {
+		line := geom.Geometry(i)
+		result = append(result, fromGeosCoords(line.CoordSeq().ToCoords()))
+	}
+	return result
 }
 
 func multiPolygonCoords(geom *geos.Geom) [][][][2]float64 {

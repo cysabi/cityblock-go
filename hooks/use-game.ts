@@ -7,7 +7,7 @@ type Player = {
   team: string;
   city: string;
   lastPoint: [number, number] | null;
-  trail: [number, number][][][] | null;
+  trail: [number, number][][] | null;
   claimed: [number, number][][][] | null;
 };
 
