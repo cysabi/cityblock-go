@@ -81,18 +81,28 @@ func updatePlayerState(game *Game, p *Player, points [][2]float64) ([]string, er
 		return []string{p.Tag}, nil
 	}
 
-	// snap to roads
-	segments, err := snapToRoads(points)
-	if err != nil {
-		return nil, err
-	}
+	// // snap to roads
+	// segments, err := snapToRoads(points)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
-	// add each matching as a line to the trail
-	for _, seg := range segments {
-		if len(seg) < 2 {
-			continue
-		}
-		line := geos.NewLineString(toGeosCoords(seg))
+	// // add each matching as a line to the trail
+	// for _, seg := range segments {
+	// 	if len(seg) < 2 {
+	// 		continue
+	// 	}
+	// 	line := geos.NewLineString(toGeosCoords(seg))
+	// 	if p.Trail == nil {
+	// 		p.Trail = geos.NewCollection(geos.TypeIDMultiLineString, []*geos.Geom{line})
+	// 	} else {
+	// 		p.Trail = p.Trail.Union(line).UnaryUnion()
+	// 	}
+	// }
+
+	// straight direct lines
+	if len(points) >= 2 {
+		line := geos.NewLineString(toGeosCoords(points))
 		if p.Trail == nil {
 			p.Trail = geos.NewCollection(geos.TypeIDMultiLineString, []*geos.Geom{line})
 		} else {
